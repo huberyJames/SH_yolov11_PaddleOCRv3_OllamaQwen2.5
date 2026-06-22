@@ -1,0 +1,32 @@
+# 核心深度学习框架
+torch==2.3.0
+torchvision==0.18.0
+
+# 计算机视觉
+ultralytics==8.3.0          # YOLOv11
+opencv-python==4.10.0.84
+
+# OCR
+paddlepaddle-gpu==2.6.1     # GPU版本
+paddleocr==2.9.1
+
+# 大模型服务
+ollama==0.3.0               # Python客户端
+
+# Web服务
+fastapi==0.115.0
+uvicorn==0.32.0
+
+# 数据处理
+numpy==1.26.4
+pandas==2.2.2
+pillow==10.4.0
+
+# 爬虫相关
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# 其他工具
+tqdm==4.66.5
+matplotlib==3.9.2
