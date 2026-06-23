@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 # =====================================================
 # 模型路径配置（统一使用 BASE_MODEL_DIR）
 # =====================================================
-BASE_MODEL_DIR = r"E:\\sh\\models"
+BASE_MODEL_DIR = r"C:\\Users\\Administrator\\Desktop\\sh\\models"
 YOLO_MODEL_DIR = os.path.join(BASE_MODEL_DIR, "yolo")      # YOLO 模型存放路径
 PADDLEOCR_MODEL_DIR = os.path.join(BASE_MODEL_DIR, "paddleocr")  # PaddleOCR 模型存放路径
 
@@ -24,7 +24,8 @@ CONFIG = {
     "iou_threshold": 0.45,               # NMS IoU阈值
 
     # 弯腰检测参数
-    "bend_angle_threshold": 30,          # 躯干角度大于此值判定为弯腰
+    "bend_angle_threshold": 30,          # 躯干角度大于此值判定为弯腰（侧面）
+    "bend_ratio_threshold": 1.5,         # 躯干/肩宽比例小于此值判定为弯腰（正面）
     "min_bend_duration": 0.5,            # 最小弯腰持续时间（秒），过滤瞬时误判
     "smooth_window": 5,                  # 平滑窗口大小
 
@@ -35,7 +36,7 @@ CONFIG = {
     "line_thickness": 2,                 # 线条粗细
 
     # 输出配置
-    "output_dir": r"E:\\sh\\output\\bend",  # 输出目录
+    "output_dir": r"C:\\Users\\Administrator\\Desktop\\sh\\output\\bend",  # 输出目录
     "save_video": True,                  # 是否保存视频
     "save_report": True,                 # 是否保存报告
     "video_fps": 30,                     # 输出视频帧率
@@ -106,11 +107,11 @@ def load_chinese_font(size=20):
     尝试多个常见字体路径，返回可用的字体对象
     """
     font_paths = [
-        r"C:\Windows\Fonts\msyh.ttc",      # 微软雅黑
-        r"C:\Windows\Fonts\simhei.ttf",    # 黑体
-        r"C:\Windows\Fonts\simsun.ttc",    # 宋体
-        r"C:\Windows\Fonts\msyhbd.ttc",    # 微软雅黑粗体
-        r"C:\Windows\Fonts\simkai.ttf",    # 楷体
+        r"C:\\Windows\\Fonts\\msyh.ttc",      # 微软雅黑
+        r"C:\\Windows\\Fonts\\simhei.ttf",    # 黑体
+        r"C:\\Windows\\Fonts\\simsun.ttc",    # 宋体
+        r"C:\\Windows\\Fonts\\msyhbd.ttc",    # 微软雅黑粗体
+        r"C:\\Windows\\Fonts\\simkai.ttf",    # 楷体
     ]
 
     for font_path in font_paths:
@@ -128,6 +129,7 @@ class BendDetector:
     """
     弯腰动作检测器
     基于人体关键点几何特征进行弯腰动作识别
+    支持正面和侧面姿态
     """
 
     def __init__(self, config=None):
@@ -135,6 +137,7 @@ class BendDetector:
         self.config = config or CONFIG
         self.model = None
         self.chinese_font = None
+        self.chinese_font_small = None
         self._init_model()
         self._init_font()
 
@@ -173,7 +176,7 @@ class BendDetector:
         self.chinese_font_small = load_chinese_font(size=16)
         print("[INFO] 字体加载完成")
 
-    def draw_chinese_text(self, frame, text, position, font_size=20, color=(255, 255, 255), 
+    def draw_chinese_text(self, frame, text, position, font_size=20, color=(255, 255, 255),
                          bg_color=None, bg_padding=5):
         """
         使用 Pillow 在 OpenCV 图像上绘制中文文字
@@ -195,7 +198,7 @@ class BendDetector:
         if bg_color is not None:
             bg_rgb = (bg_color[2], bg_color[1], bg_color[0])
             draw.rectangle(
-                [(x - bg_padding, y - bg_padding), 
+                [(x - bg_padding, y - bg_padding),
                  (x + text_w + bg_padding, y + text_h + bg_padding)],
                 fill=bg_rgb
             )
@@ -205,9 +208,10 @@ class BendDetector:
 
         return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-    def calculate_torso_angle(self, keypoints):
+    def calculate_torso_metrics(self, keypoints):
         """
-        计算躯干与垂直方向的夹角
+        计算躯干相关指标
+        返回：躯干角度、躯干/肩宽比例、置信度
         """
         left_shoulder = keypoints[5][:2]
         right_shoulder = keypoints[6][:2]
@@ -219,36 +223,46 @@ class BendDetector:
         confidence = min(conf_shoulder, conf_hip)
 
         if confidence < 0.3:
-            return None, 0
+            return None, None, 0
 
         shoulder_center = (left_shoulder + right_shoulder) / 2
         hip_center = (left_hip + right_hip) / 2
 
+        # 躯干向量
         torso_vector = shoulder_center - hip_center
 
+        # 指标1：躯干与垂直方向的夹角（侧面弯腰有效）
         vertical = np.array([0, -1])
         torso_angle = np.degrees(np.arccos(
             np.clip(np.dot(torso_vector, vertical) / (np.linalg.norm(torso_vector) + 1e-6), -1, 1)
         ))
 
-        return torso_angle, confidence
+        # 指标2：躯干长度 / 肩宽 比例（正面弯腰有效）
+        shoulder_width = np.linalg.norm(left_shoulder - right_shoulder)
+        torso_length = np.linalg.norm(torso_vector)
+        ratio = torso_length / shoulder_width if shoulder_width > 0 else 999
+
+        return torso_angle, ratio, confidence
 
     def is_bending_pose(self, keypoints):
         """
         判断是否为弯腰动作
-        核心逻辑：躯干角度大于阈值即为弯腰
+        综合使用躯干角度（侧面）和躯干/肩宽比例（正面）
         """
-        scores = {}
+        torso_angle, ratio, confidence = self.calculate_torso_metrics(keypoints)
 
-        torso_angle, conf = self.calculate_torso_angle(keypoints)
-        if torso_angle is not None:
-            scores['torso_angle'] = torso_angle
-            is_bending = torso_angle > self.config["bend_angle_threshold"]
-        else:
-            is_bending = False
-            scores['torso_angle'] = None
+        if torso_angle is None:
+            return False, {'confidence': confidence}
 
-        scores['is_bending'] = is_bending
+        # 弯腰判定：角度大（侧面） OR 比例小（正面投影缩短）
+        is_bending = (torso_angle > self.config["bend_angle_threshold"]) or (ratio < self.config["bend_ratio_threshold"])
+
+        scores = {
+            'torso_angle': round(torso_angle, 1),
+            'torso_ratio': round(ratio, 2),
+            'confidence': round(confidence, 2),
+            'is_bending': is_bending
+        }
 
         return is_bending, scores
 
@@ -300,18 +314,20 @@ class BendDetector:
             bg_color = (255, 255, 255)
 
         frame[:] = self.draw_chinese_text(
-            frame, label, (x1 + 5, y1 - 30), 
+            frame, label, (x1 + 5, y1 - 30),
             font_size=20, color=label_color, bg_color=bg_color, bg_padding=3
         )
 
         info_lines = []
         if scores.get('torso_angle') is not None:
-            info_lines.append(f"躯干角度: {scores['torso_angle']:.1f}°")
+            info_lines.append(f"躯干角度: {scores['torso_angle']:.1f}\u00b0")
+        if scores.get('torso_ratio') is not None:
+            info_lines.append(f"躯干比例: {scores['torso_ratio']:.2f}")
 
         for i, line in enumerate(info_lines):
-            y_pos = y1 + 20 + i * 25
+            y_pos = y2 + 20 + i * 25
             frame[:] = self.draw_chinese_text(
-                frame, line, (x2 + 5, y_pos),
+                frame, line, (x1 + 5, y_pos),
                 font_size=16, color=(255, 255, 255)
             )
 
@@ -361,7 +377,7 @@ class BendDetector:
             frame_count += 1
             current_time = frame_count / fps
 
-            results = self.model(frame, conf=self.config["conf_threshold"], 
+            results = self.model(frame, conf=self.config["conf_threshold"],
                                 iou=self.config["iou_threshold"], verbose=False)
 
             frame_bend_detected = False
@@ -515,14 +531,14 @@ def main():
 
     detector = BendDetector()
 
-    video_path = r"E:\\sh\\video\\input.mp4"
+    video_path = r"C:\\Users\\Administrator\\Desktop\\sh\\video\\bend2.mp4"
 
     if not os.path.exists(video_path):
         print(f"[WARNING] 视频文件不存在: {video_path}")
         print("[INFO] 请将视频文件放置到指定路径，或修改 video_path 变量")
         print("[INFO] 支持的格式: .mp4, .avi, .mov, .mkv 等")
         print("\n示例路径:")
-        print(f"  视频输入: E:\\sh\\video\\input.mp4")
+        print(f"  视频输入: C:\\Users\\Administrator\\Desktop\\sh\\video\\bend2.mp4")
         print(f"  模型目录: {YOLO_MODEL_DIR}")
         print(f"  输出目录: {CONFIG['output_dir']}")
         return
